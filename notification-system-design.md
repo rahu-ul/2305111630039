@@ -1010,6 +1010,463 @@ These enhancements can be introduced incrementally because the layered architect
 
 The Campus Notification System adopts a layered architecture that emphasizes modularity, scalability, and operational reliability. Stateless authentication, standardized REST APIs, structured logging, centralized error handling, optimized MongoDB design, and enterprise security practices provide a strong foundation for production deployment. By separating concerns across frontend, backend, service, and data layers, the system remains maintainable and adaptable to future requirements such as real-time notifications, administrative workflows, and advanced analytics without significant architectural changes.
 
+------
+
+# Stage 2
+
+This stage extends the Campus Notification Platform described in Stage 1. The existing layered architecture (React + Material UI frontend, Node.js + Express backend, external authentication, logging middleware, and Notification APIs) remains unchanged. Stage 2 focuses exclusively on the persistence layer, database design, query optimization, scalability, and implementation considerations.
+
+---
+
+# 2.1 Database Selection
+
+## Selected Database: MongoDB (NoSQL)
+
+MongoDB is selected because the notification platform primarily manages document-oriented data that evolves over time. Notification records may include optional fields such as attachments, links, metadata, or future notification attributes without requiring expensive schema migrations.
+
+The application workload is dominated by:
+
+* Read-heavy notification retrieval
+* Filtering by category and priority
+* Time-based sorting
+* Pagination
+* Full-text search
+* Per-user read status
+
+MongoDB naturally supports these access patterns while integrating seamlessly with the Node.js and Express ecosystem through Mongoose.
+
+### Comparison with SQL
+
+| MongoDB                     | Relational Database                     |
+| --------------------------- | --------------------------------------- |
+| Flexible schema             | Fixed schema                            |
+| JSON documents              | Rows and columns                        |
+| Fast document retrieval     | Strong relational consistency           |
+| Easy horizontal scaling     | More complex scaling                    |
+| Ideal for notification data | Better for highly transactional systems |
+
+Since the platform does not perform complex joins or financial transactions, MongoDB provides a simpler and more maintainable solution while meeting all functional requirements.
+
+---
+
+# 2.2 Database Schema
+
+Two primary collections are used.
+
+## Notifications Collection
+
+| Field       | Type     | Constraint  | Default      | Index        |
+| ----------- | -------- | ----------- | ------------ | ------------ |
+| _id         | ObjectId | Primary Key | Auto         | Yes          |
+| title       | String   | Required    | —            | Text         |
+| description | String   | Required    | —            | Text         |
+| category    | String   | Enum        | placement    | Yes          |
+| priority    | String   | Enum        | medium       | Yes          |
+| source      | String   | Required    | —            | No           |
+| attachments | Array    | Optional    | []           | No           |
+| publishedAt | Date     | Required    | Current Date | Yes          |
+| expiresAt   | Date     | Optional    | Null         | TTL (Future) |
+| createdAt   | Date     | Auto        | Current Date | Yes          |
+| updatedAt   | Date     | Auto        | Current Date | No           |
+
+### Field Explanation
+
+* **title** – Notification heading displayed in the list view.
+* **description** – Detailed notification content.
+* **category** – Placement, Result, or Event.
+* **priority** – Determines display order.
+* **source** – Department or authority issuing the notification.
+* **attachments** – Supporting files or documents.
+* **publishedAt** – Used for sorting latest notifications.
+* **expiresAt** – Future archival support.
+* **createdAt/updatedAt** – Audit timestamps managed automatically.
+
+---
+
+## UserNotifications Collection
+
+Read status is stored separately to avoid duplicating notification documents.
+
+| Field          | Type     | Constraint    | Index    |
+| -------------- | -------- | ------------- | -------- |
+| _id            | ObjectId | Primary Key   | Yes      |
+| userId         | String   | Required      | Yes      |
+| notificationId | ObjectId | Reference     | Compound |
+| isRead         | Boolean  | Default False | Yes      |
+| readAt         | Date     | Nullable      | No       |
+| createdAt      | Date     | Auto          | No       |
+| updatedAt      | Date     | Auto          | No       |
+
+This design supports millions of users without modifying the original notification document.
+
+---
+
+# 2.3 Entity Relationships
+
+The database follows a hybrid document model.
+
+```
+Notification
+      │
+      │ 1
+      │
+      ▼
+UserNotification
+      ▲
+      │
+      │ Many
+      │
+Student(User)
+```
+
+### Relationship Description
+
+* One notification can belong to many students.
+* Each student maintains an independent read status.
+* Notifications remain immutable once published.
+* User-specific metadata is stored in a referenced collection.
+
+### Embedded vs Referenced Documents
+
+Attachments are embedded because they are tightly coupled with notifications and always retrieved together.
+
+Read status is referenced because it varies for every user and would otherwise duplicate notification data across documents.
+
+---
+
+# 2.4 Indexing Strategy
+
+Efficient indexing is essential because notification retrieval is the most frequent operation.
+
+| Index                    | Purpose              | Complexity            |
+| ------------------------ | -------------------- | --------------------- |
+| _id                      | Primary lookup       | O(log n)              |
+| createdAt                | Latest notifications | O(log n)              |
+| category                 | Category filtering   | O(log n)              |
+| priority                 | Priority sorting     | O(log n)              |
+| isRead                   | Unread queries       | O(log n)              |
+| Text(title, description) | Search               | Optimized text search |
+
+### Compound Index
+
+```
+category + priority + publishedAt
+```
+
+Supports queries such as:
+
+* High priority placement notifications.
+* Latest event notifications.
+* Category filtering with chronological sorting.
+
+Without this index, MongoDB would perform expensive collection scans as the dataset grows.
+
+---
+
+# 2.5 Query Design
+
+The following queries directly support the REST APIs defined in Stage 1.
+
+### Fetch Notifications
+
+```javascript
+db.notifications.find({})
+.sort({publishedAt:-1})
+.skip((page-1)*limit)
+.limit(limit)
+```
+
+Returns paginated notifications ordered by publication date.
+
+---
+
+### Filter by Category
+
+```javascript
+db.notifications.find({
+category:"placement"
+})
+```
+
+Uses the category index for efficient retrieval.
+
+---
+
+### Filter by Priority
+
+```javascript
+db.notifications.find({
+priority:"high"
+})
+```
+
+Ensures urgent notifications appear first.
+
+---
+
+### Latest Notifications
+
+```javascript
+db.notifications.find({})
+.sort({publishedAt:-1})
+.limit(10)
+```
+
+Returns the ten most recent notifications.
+
+---
+
+### Full Text Search
+
+```javascript
+db.notifications.find({
+$text:{
+$search:"Google"
+}
+})
+```
+
+Uses MongoDB text indexes on title and description.
+
+---
+
+### Unread Notifications
+
+```javascript
+db.userNotifications.find({
+userId:"STU10245",
+isRead:false
+})
+```
+
+Supports unread filters and notification badges.
+
+---
+
+### Mark Notification as Read
+
+```javascript
+db.userNotifications.updateOne(
+{
+userId:"STU10245",
+notificationId:ObjectId(id)
+},
+{
+$set:{
+isRead:true,
+readAt:new Date()
+}
+}
+)
+```
+
+Updates only the user's read state without modifying the notification.
+
+---
+
+### Count Unread Notifications
+
+```javascript
+db.userNotifications.countDocuments({
+userId:"STU10245",
+isRead:false
+})
+```
+
+Supports the unread badge displayed in the application header.
+
+---
+
+# 2.6 Scalability Problems
+
+As adoption grows, several database challenges may emerge.
+
+### Large Collections
+
+Thousands of notifications accumulated over multiple semesters increase storage requirements and query costs.
+
+### Slow Pagination
+
+Using large `skip()` values becomes inefficient for deep pages because MongoDB scans skipped documents.
+
+### Frequent Reads
+
+Students repeatedly request the same notification list during placement seasons, increasing read load.
+
+### High Write Volume
+
+Publishing multiple notifications within short intervals can temporarily increase write latency.
+
+### Index Growth
+
+Additional indexes improve query performance but consume memory and storage.
+
+### Duplicate Notifications
+
+Repeated synchronization with the external notification API may introduce duplicate records if uniqueness is not enforced.
+
+### Storage Growth
+
+Attachments and historical notifications continuously increase disk utilization.
+
+### Memory Pressure
+
+Large working sets may exceed available RAM, forcing disk-based reads.
+
+### Network Latency
+
+External Notification API calls increase end-to-end response time.
+
+---
+
+# 2.7 Scalability Solutions
+
+The proposed solutions remain achievable within the project scope.
+
+| Problem                 | Solution                                                  |
+| ----------------------- | --------------------------------------------------------- |
+| Large Collections       | Archive expired notifications                             |
+| Slow Pagination         | Use indexed sorting and cursor-based pagination in future |
+| Frequent Reads          | Future Redis cache for unread counts and categories       |
+| High Writes             | Batch synchronization jobs                                |
+| Duplicate Notifications | Unique external notification ID validation                |
+| Storage Growth          | Archive historical records                                |
+| Memory Pressure         | Proper indexing and query projection                      |
+| Network Latency         | Connection reuse and request timeouts                     |
+
+Connection pooling provided by the MongoDB driver reduces repeated connection establishment overhead.
+
+Caching is intentionally listed as a future enhancement rather than a current dependency to keep the implementation lightweight.
+
+---
+
+# 2.8 Database Security
+
+Database security follows defense-in-depth principles.
+
+### Input Validation
+
+All request parameters are validated before reaching the repository layer.
+
+### Injection Prevention
+
+Queries are constructed using Mongoose models instead of dynamically concatenated strings, preventing NoSQL injection attacks.
+
+### Data Integrity
+
+* Required fields
+* Enum validation
+* Automatic timestamps
+* Unique constraints where applicable
+
+### Access Control
+
+Application users never communicate directly with MongoDB.
+
+Only the backend service has database access.
+
+### Least Privilege
+
+The database account is granted only the permissions required for notification operations.
+
+Administrative privileges are reserved for deployment and maintenance.
+
+### Environment Variables
+
+Sensitive values are stored outside source code.
+
+Examples:
+
+* `MONGODB_URI`
+* `DB_USERNAME`
+* `DB_PASSWORD`
+
+### Secrets Management
+
+Production environments should use managed secret stores such as AWS Secrets Manager or Azure Key Vault rather than hard-coded credentials.
+
+---
+
+# 2.9 Performance Optimization
+
+Several optimization techniques are incorporated into the database layer.
+
+### Pagination
+
+Server-side pagination limits result sets to reduce memory usage and response time.
+
+### Projection
+
+Only required fields are returned for list views.
+
+Example:
+
+```javascript
+db.notifications.find(
+{},
+{
+title:1,
+category:1,
+priority:1,
+publishedAt:1
+}
+)
+```
+
+Reducing document size improves throughput.
+
+### Index Usage
+
+Frequently queried fields are indexed to minimize collection scans.
+
+### Sorting
+
+Sorting uses indexed fields (`publishedAt`, `priority`) to avoid in-memory sorting.
+
+### Limited Response Fields
+
+Detailed notification content is retrieved only when the user opens an individual notification.
+
+### Connection Reuse
+
+MongoDB connection pooling allows multiple requests to reuse existing database connections, reducing latency and improving throughput.
+
+Under normal campus workloads, these optimizations are expected to keep notification retrieval below the performance targets established in Stage 1.
+
+---
+
+# 2.10 API Mapping
+
+| REST API                        | Controller             | Service             | Database Operation          | Response             |
+| ------------------------------- | ---------------------- | ------------------- | --------------------------- | -------------------- |
+| GET /notifications              | NotificationController | NotificationService | `find()`                    | Notification List    |
+| GET /notifications/:id          | NotificationController | NotificationService | `findById()`                | Notification Details |
+| GET /notifications/categories   | NotificationController | NotificationService | `distinct()`                | Categories           |
+| PATCH /notifications/:id/read   | NotificationController | NotificationService | `updateOne()`               | Updated Status       |
+| GET /notifications/unread-count | NotificationController | NotificationService | `countDocuments()`          | Count                |
+| POST /notifications/refresh     | NotificationController | NotificationService | `insertMany()/updateMany()` | Sync Result          |
+| GET /health                     | HealthController       | HealthService       | Database Ping               | Health Status        |
+
+The controller validates requests, the service applies business rules, and the repository executes optimized MongoDB operations before returning a standardized response.
+
+---
+
+# 2.11 Future Improvements
+
+The current database design intentionally avoids unnecessary complexity while leaving room for practical enhancements.
+
+Future improvements include:
+
+* **Redis Cache** for frequently accessed notification lists and unread counts.
+* **MongoDB Replica Sets** to improve availability and fault tolerance.
+* **Sharding** for horizontal scaling if notification volume grows significantly.
+* **TTL Indexes** to automatically remove expired notifications after archival.
+* **Analytics Database** for reporting without impacting operational queries.
+* **Data Warehouse Integration** for institutional reporting and long-term analytics.
+
+These enhancements are identified as future work and are not required for the current implementation, ensuring the solution remains achievable within the scope of the Affordmed evaluation while supporting future growth.
+
+
 
 
 
