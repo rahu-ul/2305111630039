@@ -1468,6 +1468,528 @@ These enhancements are identified as future work and are not required for the cu
 
 
 
+-------
+
+# Stage 3
+
+## Database Performance Review
+
+This stage extends the existing Software Design Document by reviewing the performance characteristics of the notification database after significant data growth. The application now serves approximately **50,000 students** and stores **5,000,000 notification records**. At this scale, query execution plans, indexing strategy, and data access patterns become critical to maintaining acceptable response times.
+
+---
+
+# 3.1 Query Analysis
+
+The current production query is:
+
+```sql
+SELECT *
+FROM notifications
+WHERE studentID = 1042
+AND isRead = false
+ORDER BY createdAt ASC;
+```
+
+## Objective
+
+The query retrieves all unread notifications for a particular student and displays them in chronological order, with the oldest unread notification appearing first.
+
+This behavior matches the functional requirements defined in Stage 1:
+
+* Retrieve notifications for an authenticated student.
+* Filter unread notifications.
+* Display notifications in a deterministic order.
+
+## Logical Correctness
+
+From a business perspective, the query is correct. It applies two filtering conditions:
+
+* `studentID = 1042`
+* `isRead = false`
+
+and then sorts the matching rows by `createdAt`.
+
+The issue is not correctness but efficiency. As the notification table grows into millions of rows, executing this query without appropriate indexing results in unnecessary work for the database engine.
+
+## Inefficiencies
+
+Several characteristics contribute to poor performance:
+
+* `SELECT *` retrieves every column, even when only a subset is required.
+* Filtering on two columns without a composite index may require scanning a large number of rows.
+* Sorting by `createdAt` may require an explicit sort operation if no suitable index exists.
+* Returning every unread notification without pagination increases memory consumption and response time.
+
+---
+
+# 3.2 Why Is the Query Slow
+
+## Full Table Scan
+
+Without a usable index, the database examines every row in the notifications table to identify records matching the requested student and unread status.
+
+With 5 million records, this means millions of comparisons for a single request.
+
+---
+
+## Large Dataset
+
+The application stores notifications for approximately 50,000 students.
+
+As the table grows:
+
+* more disk pages must be accessed,
+* cache efficiency decreases,
+* response time increases.
+
+Query latency grows because more data must be inspected before the matching rows are located.
+
+---
+
+## Sorting Cost
+
+The query requests:
+
+```sql
+ORDER BY createdAt ASC
+```
+
+If the filtered result is not already ordered by an index, the database performs an additional sorting step.
+
+This may involve:
+
+* allocating temporary memory,
+* sorting thousands of rows,
+* spilling to disk if memory limits are exceeded.
+
+Sorting therefore becomes an additional performance bottleneck beyond filtering.
+
+---
+
+## Missing Indexes
+
+If indexes do not exist on the filtering columns, the optimizer has no efficient access path.
+
+Instead of performing indexed lookups, it performs sequential scans followed by sorting.
+
+---
+
+## Disk I/O
+
+Rows not present in memory must be read from storage.
+
+Large sequential scans increase:
+
+* disk reads,
+* storage latency,
+* operating system cache pressure.
+
+Reducing the number of pages read has a direct impact on response time.
+
+---
+
+## Memory Usage
+
+Sorting operations consume memory.
+
+Large result sets may exceed the database's configured sort buffer, forcing temporary data to disk.
+
+Disk-based sorting is significantly slower than in-memory sorting.
+
+---
+
+## Execution Plan
+
+Without suitable indexes, a typical execution plan is:
+
+```text
+Table Scan
+      ↓
+Apply studentID Filter
+      ↓
+Apply isRead Filter
+      ↓
+Sort by createdAt
+      ↓
+Return Results
+```
+
+The expensive steps are the table scan and explicit sort.
+
+---
+
+## Temporary Tables
+
+Some database engines create temporary tables when sorting or processing large intermediate results.
+
+Temporary tables increase:
+
+* memory allocation,
+* disk usage,
+* execution time.
+
+Avoiding them is one of the primary goals of index optimization.
+
+---
+
+# 3.3 Time Complexity
+
+Theoretical complexity provides a useful approximation of query behavior.
+
+| Strategy        | Estimated Complexity |
+| --------------- | -------------------- |
+| No Index        | O(n) + O(k log k)    |
+| Single Index    | O(log n + k)         |
+| Composite Index | O(log n + k)         |
+
+Where:
+
+* **n** = total rows in the table.
+* **k** = matching rows for a student.
+
+### Without Index
+
+Every row is examined.
+
+Complexity:
+
+```text
+O(n)
+```
+
+followed by sorting:
+
+```text
+O(k log k)
+```
+
+---
+
+### With Single Index
+
+Indexing only `studentID` reduces lookup time but still requires filtering unread records and possibly sorting.
+
+Performance improves substantially but is not optimal.
+
+---
+
+### With Composite Index
+
+A composite index matching the filter and sort order allows the optimizer to:
+
+* locate matching rows,
+* preserve ordering,
+* avoid an explicit sort.
+
+This is the preferred production solution.
+
+---
+
+# 3.4 Index Design
+
+## Primary Key
+
+```sql
+PRIMARY KEY (notificationID)
+```
+
+Supports direct notification lookup.
+
+---
+
+## Student Index
+
+```sql
+CREATE INDEX idx_student
+ON notifications(studentID);
+```
+
+Accelerates student-specific queries.
+
+---
+
+## Read Status Index
+
+```sql
+CREATE INDEX idx_isread
+ON notifications(isRead);
+```
+
+Useful when unread notifications represent only a small percentage of records.
+
+---
+
+## Created Time Index
+
+```sql
+CREATE INDEX idx_created
+ON notifications(createdAt);
+```
+
+Supports chronological queries.
+
+---
+
+## Composite Index (Recommended)
+
+```sql
+CREATE INDEX idx_student_read_created
+ON notifications(studentID, isRead, createdAt);
+```
+
+### Why This Order?
+
+The optimizer evaluates predicates from left to right.
+
+* `studentID` has high selectivity.
+* `isRead` further narrows the result set.
+* `createdAt` satisfies the required ordering.
+
+Because the index already stores rows in `createdAt` order for each `(studentID, isRead)` combination, the database can often avoid an additional sort operation.
+
+---
+
+## Covering Index
+
+If list views require only summary information, a covering index can reduce table lookups.
+
+Example:
+
+```sql
+(studentID, isRead, createdAt, notificationType, title)
+```
+
+The database can satisfy many requests directly from the index without accessing the table pages.
+
+---
+
+# 3.5 Optimized Query
+
+Instead of retrieving every column:
+
+```sql
+SELECT notificationID,
+       title,
+       notificationType,
+       createdAt
+FROM notifications
+WHERE studentID = 1042
+  AND isRead = FALSE
+ORDER BY createdAt ASC
+LIMIT 50;
+```
+
+### Improvements
+
+* Avoids `SELECT *`.
+* Returns only required fields.
+* Uses pagination through `LIMIT`.
+* Enables index-assisted ordering.
+* Reduces network traffic and memory usage.
+
+When the composite index exists, `ORDER BY createdAt` can be satisfied directly from the index, eliminating the expensive sort phase.
+
+---
+
+# 3.6 Should Every Column Be Indexed?
+
+No.
+
+Indexing every column is generally poor engineering practice.
+
+## Storage Overhead
+
+Each index consumes additional disk space.
+
+More indexes mean larger databases and increased backup sizes.
+
+---
+
+## Insert Cost
+
+Every insert must update every affected index.
+
+Additional indexes therefore increase write latency.
+
+---
+
+## Update Cost
+
+Updating indexed columns requires rebuilding index entries.
+
+Frequently updated fields become more expensive to maintain.
+
+---
+
+## Delete Cost
+
+Deleting rows also requires removing entries from every related index.
+
+Large numbers of indexes slow deletion operations.
+
+---
+
+## Optimizer Complexity
+
+More indexes increase the number of execution plans the optimizer must evaluate.
+
+Excessive indexing can actually result in poorer plan selection.
+
+---
+
+## Maintenance Cost
+
+Indexes require:
+
+* monitoring,
+* rebuilding,
+* statistics updates,
+* storage management.
+
+Indexes should therefore exist only when justified by real query patterns.
+
+The recommended approach is to index frequently filtered, joined, or sorted columns rather than indexing every attribute.
+
+---
+
+# 3.7 Placement Query
+
+The following query returns every student who received a **Placement** notification during the previous seven days.
+
+```sql
+SELECT DISTINCT studentID,
+       notificationID,
+       title,
+       createdAt
+FROM notifications
+WHERE notificationType = 'Placement'
+  AND createdAt >= CURRENT_DATE - INTERVAL 7 DAY
+ORDER BY createdAt DESC;
+```
+
+### Explanation
+
+* Filters only placement notifications.
+* Restricts results to the last seven days.
+* Returns unique student records.
+* Orders the newest notifications first.
+
+For PostgreSQL, the interval syntax becomes:
+
+```sql
+CURRENT_DATE - INTERVAL '7 days'
+```
+
+---
+
+# 3.8 Additional Performance Improvements
+
+## Pagination
+
+Always retrieve notifications in pages rather than loading the complete result set.
+
+```sql
+LIMIT 50 OFFSET 0;
+```
+
+---
+
+## Projection
+
+Avoid:
+
+```sql
+SELECT *
+```
+
+Return only fields required by the client.
+
+Smaller result sets reduce network transfer and memory usage.
+
+---
+
+## Index Usage
+
+Verify execution plans regularly using `EXPLAIN` to ensure indexes are actually being used.
+
+Unused indexes increase maintenance cost without improving performance.
+
+---
+
+## Sorting
+
+Prefer sorting on indexed columns.
+
+This avoids expensive in-memory or disk-based sorting operations.
+
+---
+
+## Connection Pooling
+
+Reuse existing database connections through the Node.js connection pool.
+
+Benefits include:
+
+* lower connection overhead,
+* improved throughput,
+* better resource utilization.
+
+---
+
+## Batch Reads
+
+Where appropriate, retrieve multiple notifications in a single query instead of issuing repeated database requests.
+
+This reduces network round trips.
+
+---
+
+## Future Enhancement: Query Cache
+
+A cache layer may later store frequently requested notification summaries or unread counts.
+
+This is intentionally future work rather than part of the current implementation.
+
+---
+
+## Future Enhancement: Partitioning
+
+Partitioning by creation date can improve maintenance and archival of historical notifications.
+
+This should be considered only if table growth significantly exceeds current projections.
+
+---
+
+## Future Enhancement: Materialized Views
+
+Frequently requested reporting queries may later use materialized views.
+
+Operational APIs should continue querying the base notification table to maintain data freshness.
+
+---
+
+# 3.9 Engineering Recommendation
+
+The current query is functionally correct but does not scale efficiently against a table containing millions of notification records.
+
+The primary performance issues are:
+
+* full table scans,
+* unnecessary sorting,
+* retrieving all columns,
+* absence of an optimal composite index.
+
+The recommended improvements are:
+
+1. Create a composite index on `(studentID, isRead, createdAt)`.
+2. Replace `SELECT *` with explicit column projection.
+3. Introduce pagination using `LIMIT`.
+4. Verify execution plans with `EXPLAIN`.
+5. Continue monitoring index usage as data volume grows.
+
+These changes significantly reduce disk I/O, minimize sorting overhead, improve cache utilization, and provide substantially faster response times while remaining straightforward to implement within the current Node.js, Express, and SQL-based architecture. Future enhancements such as query caching, partitioning, and materialized views can be introduced incrementally if application growth demands additional optimization.
+
+
 
 
 
